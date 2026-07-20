@@ -258,12 +258,20 @@ let packet = Tpkt::new(&tpdu).to_vec().unwrap();
 ```sh
 cargo build            # zero dependencies
 cargo test
-cargo build --features tls   # opt-in TLS connector (pulls in rustls)
+cargo build --features tls        # opt-in TLS connector (pulls in rustls)
+cargo build --features platform   # opt-in platform::net::TcpStream adapter
 ```
 
 The default build has no dependencies and keeps an MSRV of 1.70. The optional
 `tls` feature pulls in `rustls` and its transitive crates, which raise the
-effective MSRV to whatever `rustls` requires.
+effective MSRV to whatever `rustls` requires. The optional `platform` feature
+pulls in [`platform`](https://github.com/baileyrd/rustils) — rustils' own
+hand-rolled OS abstraction layer, not a third-party framework, so it doesn't
+compromise the dependency-free ethos the `tls` feature already establishes an
+exception to — and similarly raises the effective MSRV to whatever `platform`
+requires. It brings in the trait crate only; you add a concrete backend
+(`platform-linux`, `platform-windows`, or `platform-mock`) yourself. See
+[`src/platform_net.rs`](src/platform_net.rs) for the adapter.
 
 ## Connecting to a server
 

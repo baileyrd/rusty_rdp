@@ -15,14 +15,27 @@ categories = ["network-programming", "encoding"]
 # an opt-in `tls` feature. Everything else, including the RDP-over-TLS protocol
 # logic itself, stays in the dependency-free core (it is generic over the
 # stream, so you can also bring your own TLS implementation).
+#
+# `platform` is the one exception to "third-party dependency": it's rustils'
+# own hand-rolled OS abstraction layer, not an opaque external crate, so
+# taking it behind its own opt-in feature (mirroring `tls`'s shape exactly)
+# doesn't compromise the dependency-free ethos the way a real third-party
+# networking framework would.
 [dependencies]
 rustls = { version = "0.23", optional = true }
+platform = { git = "https://github.com/baileyrd/rustils", optional = true }
 
 [features]
 # Enables `tls::connect_tls`, a convenience connector that upgrades the TCP
 # stream to TLS with rustls before driving `establish_enhanced`. Off by
 # default; enabling it pulls in rustls and its transitive dependencies.
 tls = ["dep:rustls"]
+# Enables `platform_net::PlatformTcpStream`, a std::io::Read+Write adapter
+# over any `platform::net::TcpStream` (Linux, Windows, or the mock backend —
+# the caller picks). Off by default; enabling it pulls in `platform` itself
+# (not a concrete backend crate — the caller adds platform-linux/
+# platform-windows/platform-mock separately).
+platform = ["dep:platform"]
 
 [lints.rust]
 unsafe_code = "forbid"

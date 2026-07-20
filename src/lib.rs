@@ -130,6 +130,8 @@ pub mod output;
 pub mod pdu;
 pub mod per;
 pub mod pixel;
+#[cfg(feature = "platform")]
+pub mod platform_net;
 pub mod planar;
 pub mod pointer;
 pub mod rdpdr;
