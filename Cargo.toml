@@ -22,7 +22,28 @@ categories = ["network-programming", "encoding"]
 # doesn't compromise the dependency-free ethos the way a real third-party
 # networking framework would.
 [dependencies]
-rustls = { version = "0.23", optional = true }
+# Still a direct dependency for the server-side TLS path
+# (`accept_tls`/`accept_tls_nla`, `TlsServerStream`) -- rusty_tls has no
+# server-side support yet, so that half of this module stays on rustls
+# directly. The client-side connectors (`connect_tls`/`connect_tls_with_csprng`/
+# the Kerberos variants) no longer touch rustls types themselves; see
+# `rusty_tls` below. `default-features = false` + explicit `ring` matches
+# `rusty_tls`'s own choice below -- Cargo unifies features across the one
+# shared `rustls` build, so leaving this on default features would compile
+# in the `aws-lc-rs` provider too, alongside `ring`, for nothing.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "ring",
+], optional = true }
+# The ecosystem's one shared TLS implementation and trust policy (see its
+# own README/ARCHITECTURE.md). Replaces this crate's own hand-built
+# `AcceptAnyServerCert` verifier on the client-side connectors with
+# `rusty_tls::TrustPolicy::DangerNoVerification` -- the same "don't verify,
+# trust is out-of-band" behavior, just named and owned by the crate whose
+# whole job is naming trust policies, not reimplemented here. Pinned to a
+# specific rev, same convention as `platform` below.
+rusty_tls = { git = "https://github.com/baileyrd/rusty_tls", rev = "cb5dbff75b0ebd3056145ebafd293180a9c8d6bd", optional = true }
 # Pinned to a specific commit (rustils' PAL group v0.8.0 — CSPRNG,
 # Sandbox, and the Net raw-fd/non-blocking escape hatch have all landed
 # as of this rev) rather than tracking `main` — a bare SHA carries the
@@ -55,7 +76,7 @@ platform-linux = { git = "https://github.com/baileyrd/rustils", rev = "525180897
 # Enables `tls::connect_tls`, a convenience connector that upgrades the TCP
 # stream to TLS with rustls before driving `establish_enhanced`. Off by
 # default; enabling it pulls in rustls and its transitive dependencies.
-tls = ["dep:rustls"]
+tls = ["dep:rustls", "dep:rusty_tls"]
 # Enables `platform_net::PlatformTcpStream`, a std::io::Read+Write adapter
 # over any `platform::net::TcpStream` (Linux, Windows, or the mock backend —
 # the caller picks). Off by default; enabling it pulls in `platform` itself

@@ -61,7 +61,7 @@ Layer by layer:
 | Clipboard redirection | `cliprdr` | MS-RDPECLIP PDUs on the `"cliprdr"` static channel: the caps/monitor-ready handshake (`CapsPdu`/`GeneralCapabilitySet`/`MonitorReadyPdu`), format announcement (`FormatListPdu`/`FormatListResponsePdu`, Long Format Name variant), data transfer (`FormatDataRequestPdu`/`FormatDataResponsePdu`, with `as_unicode_text()` for `CF_UNICODETEXT`), and file copy/paste (`FileList`/`FileDescriptor` for the `CFSTR_FILEDESCRIPTORW` format, `FileContentsRequestPdu`/`FileContentsResponsePdu` to pull a file's size or byte ranges, `LockClipDataPdu`/`UnlockClipDataPdu`). `CB_TEMP_DIRECTORY` and the Short Format Name variant are not implemented. |
 | Audio redirection | `rdpsnd` | MS-RDPEA PDUs on the `"rdpsnd"` static channel: format negotiation (`AudioFormatsPdu`/`AudioFormat`), bandwidth training (`TrainingPdu`/`TrainingConfirmPdu`), wave playback — both the legacy WaveInfo/Wave PDU split (`encode_wave`/`decode_wave` hide the split) and the newer single-PDU `Wave2Pdu` (`SNDC_WAVE2`, used once both sides negotiate version 8+) — `WaveConfirmPdu`, `ClosePdu`, volume/pitch control (`VolumePdu`/`PitchPdu`), and encryption key distribution (`CryptKeyPdu`). Everything that rides over UDP instead of this channel (encrypted wave data, the UDP wave PDUs) is not implemented. |
 | Device redirection | `rdpdr` | MS-RDPEFS PDUs on the `"rdpdr"` static channel: the full initialization/capability handshake (`ServerAnnounceRequestPdu`/`ClientAnnounceReplyPdu`/`ServerClientIdConfirmPdu`/`ClientNameRequestPdu`, `ServerCoreCapabilityPdu`/`ClientCoreCapabilityPdu` with `GeneralCapsSet`, `ClientDeviceListAnnouncePdu`/`ServerDeviceAnnounceResponsePdu`, `ServerUserLoggedOnPdu`), and the full Device I/O Request/Response exchange (`DeviceIoRequest`/`DeviceIoResponse` headers) for every major function but one: create/close/read/write (`DeviceCreateRequestPdu`/`RspPdu`, `DeviceCloseRequestPdu`/`RspPdu`, `DeviceReadRequestPdu`/`RspPdu`, `DeviceWriteRequestPdu`/`RspPdu`), the generic IOCTL/FSCTL carrier (`DeviceControlRequestPdu`/`RspPdu`) that smart-card and port redirection ride on, query/set file information (`QueryInformationRequestPdu`/`RspPdu`, `SetInformationRequestPdu`/`RspPdu`), query/set volume information (`QueryVolumeInformationRequestPdu`/`RspPdu`, `SetVolumeInformationRequestPdu`/`RspPdu`), and directory control — listing (`QueryDirectoryRequestPdu`/`RspPdu`) and change notification (`NotifyChangeDirectoryRequestPdu`/`RspPdu`). Lock control is not implemented — its request layout isn't in Microsoft's published spec pages, and no reference client (FreeRDP, rdesktop, xrdp) actually parses it either. |
-| TLS connector | `tls` | *(optional `tls` feature)* `connect_tls()` — upgrades the TCP stream to TLS with `rustls` and drives `establish_enhanced()`; `accept_tls()`/`accept_tls_nla()` are the server-side counterparts, negotiating `SSL`/`HYBRID` respectively and driving `RdpTransport::accept`'s shared post-negotiation logic over a caller-supplied `rustls::ServerConfig` (`accept_tls_nla` also runs `CredSspServer` first, and returns the delegated `NlaIdentity`). The crate's only third-party dependency, and off by default. |
+| TLS connector | `tls` | *(optional `tls` feature)* `connect_tls()` — upgrades the TCP stream to TLS with [`rusty_tls`](https://github.com/baileyrd/rusty_tls) (the rusty ecosystem's shared TLS implementation and trust policy) and drives `establish_enhanced()`; `accept_tls()`/`accept_tls_nla()` are the server-side counterparts, negotiating `SSL`/`HYBRID` respectively and driving `RdpTransport::accept`'s shared post-negotiation logic over a caller-supplied `rustls::ServerConfig` directly (`rusty_tls` has no server-side support yet) (`accept_tls_nla` also runs `CredSspServer` first, and returns the delegated `NlaIdentity`). The crate's only third-party dependencies, and off by default. |
 | BER (X.690) | `ber` | The definite-length TLV subset the MCS connection PDUs need. |
 | PER (X.691) | `per` | The ALIGNED-PER subset the MCS domain PDUs and GCC envelope need. |
 | Byte cursors | `cursor` | Explicit big/little-endian, bounds-checked read/write. |
@@ -105,10 +105,12 @@ the exact `(ap_req_bytes, session_key)` pair `connect_tls_kerberos` takes.
 > deliberately weak algorithms (RC4, MD5/SHA-1 MACs, unpadded RSA) purely to
 > speak RDP *standard security*. They are not for general use; modern
 > deployments should negotiate TLS/CredSSP. The `tls` feature's `connect_tls()`
-> does **not** verify the server certificate (RDP servers are typically
-> self-signed with out-of-band trust), so it does not defend against an active
-> man-in-the-middle — bring your own verified `rustls` stream and use
-> `establish_enhanced()` if you need that.
+> uses `rusty_tls::TrustPolicy::DangerNoVerification` — it does **not** verify
+> the server certificate (RDP servers are typically self-signed with
+> out-of-band trust), so it does not defend against an active
+> man-in-the-middle — bring your own verified TLS stream (e.g. `rusty_tls`
+> with `TrustPolicy::System`/`PinnedAnchors`) and use `establish_enhanced()`
+> if you need that.
 
 ## Roadmap
 
@@ -226,8 +228,9 @@ the order they'd add the most value:
   blocking driver kept apart from the codec.
 - **Minimal dependencies.** The core has zero. The one thing that genuinely
   needs a third-party crate — a TLS stack, which cannot be hand-rolled
-  responsibly — lives behind the optional `tls` feature (`rustls`), never in
-  the default build. Even the RDP-over-TLS *protocol* logic stays in the
+  responsibly — lives behind the optional `tls` feature (`rustls` for the
+  server side, `rusty_tls` for the client connectors), never in the default
+  build. Even the RDP-over-TLS *protocol* logic stays in the
   dependency-free core: the transport is generic over the stream, so you can
   bring your own TLS implementation instead. RSA for standard RDP security is
   hand-rolled, so it needs no crate.
@@ -258,14 +261,15 @@ let packet = Tpkt::new(&tpdu).to_vec().unwrap();
 ```sh
 cargo build            # zero dependencies
 cargo test
-cargo build --features tls        # opt-in TLS connector (pulls in rustls)
+cargo build --features tls        # opt-in TLS connector (pulls in rustls + rusty_tls)
 cargo build --features platform   # opt-in platform::net::TcpStream adapter
 cargo build --features serve-example   # opt-in `serve` example (Sandbox confinement)
 ```
 
 The default build has no dependencies and keeps an MSRV of 1.70. The optional
-`tls` feature pulls in `rustls` and its transitive crates, which raise the
-effective MSRV to whatever `rustls` requires. The optional `platform` feature
+`tls` feature pulls in `rustls` and `rusty_tls` (and their transitive
+crates), which raise the effective MSRV to whatever they require. The
+optional `platform` feature
 pulls in [`platform`](https://github.com/baileyrd/rustils) — rustils' own
 hand-rolled OS abstraction layer, not a third-party framework, so it doesn't
 compromise the dependency-free ethos the `tls` feature already establishes an

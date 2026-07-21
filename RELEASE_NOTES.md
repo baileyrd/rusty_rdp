@@ -4,6 +4,36 @@ The story of `rusty_rdp`, one wire format at a time. Newest first.
 
 ---
 
+## Client-side TLS now runs on `rusty_tls`
+**2026-07-21**
+
+- **Changed:** `connect_tls()`/`connect_tls_with_csprng()` (and the Kerberos
+  variants) now build their TLS connection through
+  [`rusty_tls`](https://github.com/baileyrd/rusty_tls) — the rusty
+  ecosystem's shared TLS implementation and trust policy — instead of this
+  crate's own hand-built `AcceptAnyServerCert` verifier. Behavior is
+  unchanged (still `TrustPolicy::DangerNoVerification`, i.e. no certificate
+  verification, matching RDP's typical self-signed/out-of-band-trust
+  deployment); what changed is who owns that decision and its name.
+- **Added (to `rusty_tls`, consumed here):** `TlsStream::complete_handshake()`
+  and `TlsStream::peer_certificate_der()` — this crate's CredSSP exchange
+  needs the server's public key for channel binding before the CredSSP
+  bytes go over the wire, which previously meant reaching directly into
+  `rustls::StreamOwned`'s internals. These two methods are the minimal
+  surface that removes that.
+- **Unchanged:** server-side TLS (`accept_tls`/`accept_tls_nla`,
+  `TlsServerStream`) — `rusty_tls` has no server-side support yet, so that
+  half of `tls.rs` still builds directly on `rustls`.
+- **Known limitation, stated plainly:** no way yet to opt a client connector
+  into real certificate verification without hand-writing your own TLS
+  stream and calling `RdpTransport::new_enhanced` directly — see the module
+  docs' Certificate verification section.
+- **Tests:** all 541 existing tests pass unmodified (543 with the `platform`
+  feature), including the full NTLM and Kerberos CredSSP/NLA flows that
+  exercise the new channel-binding path end to end. `cargo clippy
+  --all-targets --all-features -- -D warnings` and `cargo fmt --check` both
+  clean.
+
 ## 0.1.0 — The Foundation Release
 
 *A dependency-free RDP codec that speaks the full connection sequence, both

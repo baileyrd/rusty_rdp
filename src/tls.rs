@@ -1,29 +1,38 @@
 //! Optional TLS + CredSSP connector for the enhanced-security path (feature
 //! `tls`).
 //!
-//! This is the crate's one concession to a third-party dependency, and it is
+//! This is the crate's one concession to third-party dependencies, and it is
 //! entirely opt-in: nothing here is compiled unless the `tls` feature is
 //! enabled, so the default build stays dependency-free. A TLS stack is the one
 //! piece that cannot be hand-rolled responsibly, so [`connect_tls`] wraps
-//! [`rustls`] to upgrade the TCP stream before handing off to
-//! [`RdpTransport::establish_enhanced`]. When the server selects CredSSP/NLA
-//! (`HYBRID`), it runs the [`crate::credssp`] exchange over the TLS channel
-//! first, delegating the user's credentials. The CredSSP crypto (NTLMv2) is
-//! all in the dependency-free core; only the TLS bytes need the crate.
+//! [`rusty_tls`] — the shared TLS implementation and trust policy the rusty
+//! ecosystem standardizes on — to upgrade the TCP stream before handing off
+//! to [`RdpTransport::establish_enhanced`]. When the server selects
+//! CredSSP/NLA (`HYBRID`), it runs the [`crate::credssp`] exchange over the
+//! TLS channel first, delegating the user's credentials. The CredSSP crypto
+//! (NTLMv2) is all in the dependency-free core; only the TLS bytes need the
+//! crate.
 //!
 //! The RDP-over-TLS *protocol* logic still lives in the dependency-free core
 //! ([`crate::net`]) — this module only supplies the bytes-on-wire TLS. If you
-//! would rather not take the rustls dependency, wrap your `TcpStream` in any
-//! TLS implementation yourself and call [`RdpTransport::new_enhanced`] +
-//! [`RdpTransport::establish_enhanced`] directly.
+//! would rather not take the `rusty_tls`/`rustls` dependencies, wrap your
+//! `TcpStream` in any TLS implementation yourself and call
+//! [`RdpTransport::new_enhanced`] + [`RdpTransport::establish_enhanced`]
+//! directly.
+//!
+//! Server-side TLS ([`accept_tls`]/[`accept_tls_nla`]) still builds directly
+//! on `rustls` — `rusty_tls` has no server-side support yet.
 //!
 //! ## Certificate verification
 //!
 //! RDP servers overwhelmingly present self-signed certificates and rely on
-//! out-of-band trust, so [`connect_tls`] does **not** verify the server
-//! certificate. That means it does not protect against an active
-//! man-in-the-middle. If you need verification, build your own [`rustls`]
-//! stream with a real verifier and use the [`RdpTransport::new_enhanced`] path.
+//! out-of-band trust, so [`connect_tls`] uses
+//! [`rusty_tls::TrustPolicy::DangerNoVerification`] — it does **not** verify
+//! the server certificate. That means it does not protect against an active
+//! man-in-the-middle. If you need verification, build your own TLS stream
+//! (`rusty_tls::TlsStream::new` with `TrustPolicy::System` or
+//! `TrustPolicy::PinnedAnchors`) and use the [`RdpTransport::new_enhanced`]
+//! path.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -31,12 +40,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection,
-    SignatureScheme, StreamOwned,
-};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 use crate::credssp::{self, CredSspClient, CredSspServer, KerberosCredSspClient};
 use crate::krb5::aes::AesKey;
@@ -45,7 +49,7 @@ use crate::net::{EstablishConfig, RdpSession, RdpTransport};
 
 /// The TLS-wrapped stream type an established enhanced-security session runs
 /// over.
-pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
+pub type TlsStream = rusty_tls::TlsStream<TcpStream>;
 
 /// Connect to an RDP server over TLS and drive the enhanced-security bring-up.
 ///
@@ -118,17 +122,11 @@ fn connect_tls_impl(
     };
     let tcp = pre.into_inner();
 
-    // 2. Upgrade the same TCP connection to TLS.
-    let tls_config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-        .with_no_client_auth();
-    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("bad server name: {e}"))
-    })?;
-    let conn = ClientConnection::new(Arc::new(tls_config), server_name)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS setup failed: {e}")))?;
-    let mut tls = StreamOwned::new(conn, tcp);
+    // 2. Upgrade the same TCP connection to TLS. See the module docs for
+    //    why `DangerNoVerification`: RDP servers overwhelmingly present
+    //    self-signed certificates and rely on out-of-band trust.
+    let mut tls =
+        rusty_tls::TlsStream::new(tcp, host, &rusty_tls::TrustPolicy::DangerNoVerification)?;
 
     // 3. If the server chose CredSSP, authenticate before the RDP sequence.
     if use_nla {
@@ -150,14 +148,7 @@ fn run_credssp_with_seed(
     seed: [u8; 56],
 ) -> io::Result<()> {
     // Complete the TLS handshake so the server certificate is available.
-    while tls.conn.is_handshaking() {
-        if tls.conn.complete_io(&mut tls.sock)?.0 == 0 && tls.conn.is_handshaking() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "TLS handshake stalled",
-            ));
-        }
-    }
+    tls.complete_handshake()?;
     let public_key = server_public_key(tls)?;
 
     let mut nonce = [0u8; 32];
@@ -278,16 +269,8 @@ fn connect_tls_kerberos_impl(
     }
     let tcp = pre.into_inner();
 
-    let tls_config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-        .with_no_client_auth();
-    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("bad server name: {e}"))
-    })?;
-    let conn = ClientConnection::new(Arc::new(tls_config), server_name)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS setup failed: {e}")))?;
-    let mut tls = StreamOwned::new(conn, tcp);
+    let mut tls =
+        rusty_tls::TlsStream::new(tcp, host, &rusty_tls::TrustPolicy::DangerNoVerification)?;
 
     run_credssp_kerberos(&mut tls, config)?;
 
@@ -451,14 +434,7 @@ fn run_credssp_kerberos_with_seed(
     session_key: AesKey,
     seed: [u8; 64],
 ) -> io::Result<()> {
-    while tls.conn.is_handshaking() {
-        if tls.conn.complete_io(&mut tls.sock)?.0 == 0 && tls.conn.is_handshaking() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "TLS handshake stalled",
-            ));
-        }
-    }
+    tls.complete_handshake()?;
     let public_key = server_public_key(tls)?;
 
     // Nonce plus two 16-byte GSS confounders.
@@ -566,14 +542,10 @@ fn read_ts_request<S: Read>(stream: &mut S) -> io::Result<Vec<u8>> {
 /// Extract the server's `SubjectPublicKeyInfo` DER from the TLS peer
 /// certificate, for the CredSSP channel binding.
 fn server_public_key(tls: &TlsStream) -> io::Result<Vec<u8>> {
-    let certs = tls
-        .conn
-        .peer_certificates()
+    let cert = tls
+        .peer_certificate_der()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no server certificate presented"))?;
-    let cert = certs
-        .first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty server certificate chain"))?;
-    extract_spki(cert.as_ref())
+    extract_spki(cert)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cannot parse certificate"))
 }
 
@@ -637,63 +609,6 @@ fn to_io(e: crate::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-/// A certificate verifier that accepts any server certificate.
-///
-/// Appropriate for RDP's typical self-signed-certificate deployments where
-/// trust is established out of band; it provides no protection against an
-/// active man-in-the-middle.
-#[derive(Debug)]
-struct AcceptAnyServerCert;
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,7 +663,7 @@ mod tests {
     ];
 
     fn test_tls_server_config() -> Arc<ServerConfig> {
-        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
         let cert = CertificateDer::from(TEST_TLS_CERT_DER.to_vec());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_TLS_KEY_PKCS8_DER.to_vec()));
