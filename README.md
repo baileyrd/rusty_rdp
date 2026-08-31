@@ -4,6 +4,12 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: 1.70+](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](#building)
 
+> **This repository has been merged into
+> [rusty-mill/rusty_mill](https://github.com/rusty-mill/rusty_mill)**, as
+> [`crates/rusty_rdp`](https://github.com/rusty-mill/rusty_mill/tree/main/crates/rusty_rdp),
+> with full commit history preserved. Please open new issues and pull
+> requests there; this standalone repository is no longer developed.
+
 A minimal, **dependency-free** implementation of the Remote Desktop Protocol
 (RDP) wire format in Rust.
 
